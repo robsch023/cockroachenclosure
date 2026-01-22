@@ -1,0 +1,23 @@
+"""
+Basic actuation/image filing code for picamera
+-> not functional here as picam is a raspberry pi package
+
+Preview used to show camera feed to the monitor.
+Not necessary for the 
+
+23/01/2026
+"""
+from picamera2 import PiCamera2, Preview
+from time import sleep, ctime, time
+
+camera = PiCamera2()
+
+def capture():
+    datetime = ctime(time())
+    camera.start_preview()
+    camera.start()
+    #sleep of min 2 seconds may cause the photo to be too delayed.
+    #wakeup on detection of motion instead of on detection of RFID might be better
+    sleep(2)
+    camera.capture('/home/pi/Desktop/data/image%s.jpg' % datetime)
+    camera.stop_preview()
