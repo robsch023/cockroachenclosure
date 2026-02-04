@@ -12,12 +12,20 @@ from time import sleep, ctime, time
 
 camera = PiCamera2()
 
-def capture():
+def capturephoto():
     datetime = ctime(time())
     camera.start_preview()
     camera.start()
     #sleep of min 2 seconds may cause the photo to be too delayed.
     #wakeup on detection of motion instead of on detection of RFID might be better
-    sleep(2)
+    sleep(1)
     camera.capture('/home/pi/Desktop/data/image%s.jpg' % datetime)
     camera.stop_preview()
+
+def hybridcapture():
+    datetime = ctime(time())
+    camera.start_preview()
+    camera.start()
+    sleep(1)
+    #take pic then record for 3 seconds
+
