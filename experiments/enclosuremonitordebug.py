@@ -1,12 +1,8 @@
-#!/usr/bin/env python3
-"""
-Enclosure Monitor - Raspberry Pi Camera
-Captures an image every 5 minutes, compiles 6-hourly timelapses, and runs
-continuous MOG2-based motion detection with GPIO alerting on a defined zone.
+import os
 
-Requires: picamera2 (pre-installed on PiOS Trixie)
-          sudo apt install -y ffmpeg python3-opencv python3-rpi.gpio
-"""
+# Must be set before cv2 or any Qt library is imported.
+# Tells OpenCV/Qt to use the Wayland backend (PiOS Trixie default).
+os.environ.setdefault("QT_QPA_PLATFORM", "wayland")
 
 import time
 import threading
@@ -28,50 +24,36 @@ IMAGES_DIR    = BASE_DIR / "images"
 TIMELAPSE_DIR = BASE_DIR / "timelapses"
 LOG_FILE      = Path("/home/rosch023/enclosure/monitor.log")
 
-CAPTURE_INTERVAL_SEC = 5 * 60          # 5 minutes between snapshots
-TIMELAPSE_FPS        = 10              # output video frame rate
-TIMELAPSE_PERIODS    = [0, 6, 12, 18]  # 6-hour period start hours
+CAPTURE_INTERVAL_SEC = 5 * 60
+TIMELAPSE_FPS        = 10
+TIMELAPSE_PERIODS    = [0, 6, 12, 18]
 
-# Camera settings
 CAMERA_WIDTH   = 1920
 CAMERA_HEIGHT  = 1080
 CAMERA_QUALITY = 85
 
-# Motion detection stream resolution (lores — keeps CPU load low)
 LORES_WIDTH  = 320
 LORES_HEIGHT = 240
 
-# Set True only if using a motorised-focus lens (e.g. Camera Module 3)
-USE_AUTOFOCUS = False
+USE_AUTOFOCUS = True
 
 # ─── Motion Detection Configuration ──────────────────────────────────────────
 
-# Minimum contour area (in lores pixels) to count as motion.
-# Increase to ignore small insects/dust, decrease for finer sensitivity.
-MOTION_MIN_AREA = 500
+MOTION_MIN_AREA       = 100
+MOTION_CONFIRM_FRAMES = 2
+MOTION_GPIO_HOLD_SEC  = 8.0
+MOTION_GPIO_PIN       = 17
 
-# How many consecutive frames must show motion before GPIO fires.
-# Reduces false positives from single-frame noise.
-MOTION_CONFIRM_FRAMES = 3
+ZONE = (80, 85, 120, 165)   # (x1, y1, x2, y2) in lores coordinates
 
-# Seconds the GPIO pin stays HIGH after motion is last detected.
-MOTION_GPIO_HOLD_SEC = 5.0
+# ─── Debug Preview ────────────────────────────────────────────────────────────
 
-# GPIO pin (BCM numbering) to pulse HIGH when zone motion is detected.
-MOTION_GPIO_PIN = 17
+# Set True to open a cv2.imshow window. Run from the desktop terminal.
+# Set False for headless/service deployment.
+DEBUG_PREVIEW = True
 
-# ── Alert Zone ────────────────────────────────────────────────────────────────
-# Defined in LORES coordinates (0–LORES_WIDTH, 0–LORES_HEIGHT).
-# The zone is a rectangle: (x1, y1) top-left → (x2, y2) bottom-right.
-# Replace these values with your desired region before deploying.
-#
-#   Full frame (no zone restriction):
-#       ZONE = (0, 0, LORES_WIDTH, LORES_HEIGHT)
-#
-#   Example — right half of frame:
-#       ZONE = (160, 0, 320, 240)
-#
-ZONE = (0, 0, LORES_WIDTH, LORES_HEIGHT)   # ← edit this
+# Preview display scale — lores is 320x240, scale 3 = 960x720 on screen
+PREVIEW_SCALE = 3
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -111,18 +93,11 @@ def image_dir_for(dt: datetime) -> Path:
 # ─── Camera initialisation ────────────────────────────────────────────────────
 
 def init_camera() -> Picamera2:
-    """
-    Open the camera once with two simultaneous streams:
-      - main  (RGB888 @ full res)  → used by capture_file() for snapshots
-      - lores (YUV420 @ 320x240)  → used by motion detection thread
-    Both streams are fed by the same sensor readout with no interference.
-    """
     cam = Picamera2()
-
     config = cam.create_still_configuration(
         main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "RGB888"},
         lores={"size": (LORES_WIDTH, LORES_HEIGHT), "format": "YUV420"},
-        display="lores",
+        display=None,
         buffer_count=4,
     )
     cam.configure(config)
@@ -195,69 +170,103 @@ def build_timelapse(day: str, period: str) -> "Path | None":
         log.error("ffmpeg timed out.")
     return None
 
-# ─── Motion Detection Thread ──────────────────────────────────────────────────
+# ─── Motion Detection + Preview Thread ───────────────────────────────────────
 
 def point_in_zone(cx: int, cy: int) -> bool:
-    """Return True if centroid (cx, cy) falls inside the alert zone."""
     x1, y1, x2, y2 = ZONE
     return x1 <= cx <= x2 and y1 <= cy <= y2
 
-def gpio_release_thread(hold_sec: float) -> None:
-    """Pull GPIO LOW after hold_sec seconds (runs in a short-lived thread)."""
+def gpio_release_thread(hold_sec: float, state: dict) -> None:
     time.sleep(hold_sec)
     GPIO.output(MOTION_GPIO_PIN, GPIO.LOW)
-    log.debug("GPIO pin %d LOW", MOTION_GPIO_PIN)
+    state["gpio_low_time"] = time.monotonic()
+    log.debug("GPIO pin %d LOW -- dead period starts (%.1fs)", MOTION_GPIO_PIN, MOTION_DEAD_SEC)
+
+def draw_debug_frame(grey: np.ndarray, contours, confirm_count: int,
+                     gpio_active: bool, in_dead_period: bool = False) -> np.ndarray:
+    """
+    Build the debug display frame from the greyscale lores image.
+    Returns a scaled BGR image with all overlays drawn on it.
+    """
+    s = PREVIEW_SCALE
+    display = cv2.cvtColor(grey, cv2.COLOR_GRAY2BGR)
+    display = cv2.resize(display, (LORES_WIDTH * s, LORES_HEIGHT * s),
+                         interpolation=cv2.INTER_LINEAR)
+
+    # ── Zone rectangle ────────────────────────────────────────────────────
+    x1, y1, x2, y2 = ZONE
+    zone_colour = (0, 255, 128) if gpio_active else (0, 220, 0)
+    cv2.rectangle(display, (x1*s, y1*s), (x2*s, y2*s), zone_colour, 2)
+    cv2.putText(display, "ZONE", (x1*s, max(0, y1*s - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, zone_colour, 1)
+
+    # ── Motion contours ───────────────────────────────────────────────────
+    valid = 0
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < MOTION_MIN_AREA:
+            continue
+        valid += 1
+        x, y, w, h = cv2.boundingRect(contour)
+        cx = x + w // 2
+        cy = y + h // 2
+        in_zone    = point_in_zone(cx, cy)
+        box_colour = (0, 140, 255) if in_zone else (0, 0, 200)
+
+        cv2.rectangle(display, (x*s, y*s), ((x+w)*s, (y+h)*s), box_colour, 1)
+        cv2.circle(display, (cx*s, cy*s), 4, (0, 255, 255), -1)
+        cv2.putText(display, f"{int(area)}", (x*s, max(0, y*s - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, box_colour, 1)
+
+    # ── HUD ───────────────────────────────────────────────────────────────
+    gpio_str    = "GPIO: HIGH" if gpio_active else "GPIO: low"
+    gpio_colour = (0, 255, 80) if gpio_active else (160, 160, 160)
+    hud = [
+        (datetime.now().strftime("%H:%M:%S"),                   (210, 210, 210)),
+        (f"Contours : {valid}",                                 (210, 210, 210)),
+        (f"Confirm  : {confirm_count}/{MOTION_CONFIRM_FRAMES}", (210, 210, 210)),
+        (gpio_str,                                              gpio_colour),
+        (f"MinArea  : {MOTION_MIN_AREA}",                       (150, 150, 150)),
+        (f"Zone     : {ZONE}",                                  (150, 150, 150)),
+        ("-- DEAD PERIOD --" if in_dead_period else "",         (0, 180, 255)),
+    ]
+    for i, (text, colour) in enumerate(hud):
+        cv2.putText(display, text, (8, 20 + i * 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 1)
+
+    return display
+
 
 def motion_detection_loop(cam: Picamera2, stop_event: threading.Event) -> None:
-    """
-    Continuously reads the lores YUV stream and applies MOG2 background
-    subtraction to detect motion.
-
-    MOG2 advantages for enclosure monitoring:
-      - Adapts automatically to slow lighting changes (day/night cycles)
-      - Built-in shadow detection (set detectShadows=False to save CPU)
-      - Robust to minor camera shake or compression artefacts
-
-    For each detected contour that exceeds MOTION_MIN_AREA:
-      - Its bounding box and centroid are logged (in lores coordinates)
-      - If the centroid falls inside ZONE and MOTION_CONFIRM_FRAMES
-        consecutive frames show motion, GPIO pin is pulled HIGH
-    """
-    # MOG2 background subtractor
-    # varThreshold: higher = less sensitive to gradual change (50 is a good
-    #               starting point for indoor enclosures with steady lighting)
-    # detectShadows: disabled to halve the per-frame CPU cost
     subtractor = cv2.createBackgroundSubtractorMOG2(
         history=500,
         varThreshold=50,
         detectShadows=False,
     )
-
-    # Morphological kernel to remove speckle noise from the foreground mask
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
-    confirm_count   = 0          # consecutive frames with zone motion
-    gpio_active     = False      # True while GPIO is HIGH
+    confirm_count = 0
+    gpio_active   = False
     gpio_timer: "threading.Thread | None" = None
+    # Shared mutable state passed into gpio_release_thread so it can record
+    # when GPIO went LOW without needing a global variable.
+    gpio_state = {"gpio_low_time": 0.0}
 
     log.info(
-        "Motion detection started -- lores %dx%d  zone=%s  min_area=%d  gpio_pin=%d",
-        LORES_WIDTH, LORES_HEIGHT, ZONE, MOTION_MIN_AREA, MOTION_GPIO_PIN,
+        "Motion detection started -- lores %dx%d  zone=%s  min_area=%d  "
+        "gpio_pin=%d  preview=%s",
+        LORES_WIDTH, LORES_HEIGHT, ZONE, MOTION_MIN_AREA,
+        MOTION_GPIO_PIN, DEBUG_PREVIEW,
     )
 
     while not stop_event.is_set():
-        # Grab a lores YUV420 frame (Y plane only = greyscale, cheapest path)
-        yuv = cam.capture_array("lores")
-        # YUV420: first LORES_HEIGHT rows are the Y (luma) plane
+        # Grab lores Y plane (greyscale) for motion detection
+        yuv  = cam.capture_array("lores")
         grey = yuv[:LORES_HEIGHT, :LORES_WIDTH]
 
-        # Apply background subtraction → binary foreground mask
         fg_mask = subtractor.apply(grey)
-
-        # Clean up noise: erode then dilate (opening operation)
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
 
-        # Find contours of moving regions
         contours, _ = cv2.findContours(
             fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
@@ -268,25 +277,30 @@ def motion_detection_loop(cam: Picamera2, stop_event: threading.Event) -> None:
             area = cv2.contourArea(contour)
             if area < MOTION_MIN_AREA:
                 continue
-
-            # Bounding box and centroid
             x, y, w, h = cv2.boundingRect(contour)
             cx = x + w // 2
             cy = y + h // 2
 
             log.debug(
-                "Motion detected -- bbox=(%d,%d,%d,%d)  centroid=(%d,%d)  area=%.0f",
+                "Motion -- bbox=(%d,%d,%d,%d)  centroid=(%d,%d)  area=%.0f",
                 x, y, w, h, cx, cy, area,
             )
 
             if point_in_zone(cx, cy):
                 zone_motion_this_frame = True
-                log.info(
-                    "Zone motion -- centroid=(%d,%d)  area=%.0f  zone=%s",
-                    cx, cy, area, ZONE,
-                )
+                log.info("Zone motion -- centroid=(%d,%d)  area=%.0f", cx, cy, area)
 
         # ── GPIO logic ────────────────────────────────────────────────────
+        # Suppress new triggers during the dead period after GPIO goes LOW
+        in_dead_period = (
+            not gpio_active
+            and (time.monotonic() - gpio_state["gpio_low_time"]) < MOTION_DEAD_SEC
+        )
+        if in_dead_period and zone_motion_this_frame:
+            log.debug("Motion suppressed -- dead period active")
+            zone_motion_this_frame = False
+            confirm_count = 0
+
         if zone_motion_this_frame:
             confirm_count += 1
             if confirm_count >= MOTION_CONFIRM_FRAMES:
@@ -294,25 +308,30 @@ def motion_detection_loop(cam: Picamera2, stop_event: threading.Event) -> None:
                     GPIO.output(MOTION_GPIO_PIN, GPIO.HIGH)
                     gpio_active = True
                     log.info("GPIO pin %d HIGH", MOTION_GPIO_PIN)
-
-                # (Re)start the hold timer on every confirmed motion frame
-                if gpio_timer and gpio_timer.is_alive():
-                    # Can't cancel a sleeping thread directly; let it expire
-                    # and suppress the LOW — reset gpio_active to keep HIGH
-                    pass
                 gpio_timer = threading.Thread(
                     target=gpio_release_thread,
-                    args=(MOTION_GPIO_HOLD_SEC,),
+                    args=(MOTION_GPIO_HOLD_SEC, gpio_state),
                     daemon=True,
                 )
                 gpio_timer.start()
         else:
             confirm_count = 0
-            # gpio_release_thread handles the delayed LOW automatically
+            if gpio_active and (gpio_timer is None or not gpio_timer.is_alive()):
+                gpio_active = False
 
-        # Small sleep to cap CPU — ~15 fps is plenty for motion detection
+        # ── Debug preview ─────────────────────────────────────────────────
+        if DEBUG_PREVIEW:
+            frame = draw_debug_frame(grey, contours, confirm_count, gpio_active, in_dead_period)
+            cv2.imshow("Enclosure Monitor", frame)
+            # q to quit the preview (stops the whole script)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                stop_event.set()
+                break
+
         time.sleep(0.065)
 
+    if DEBUG_PREVIEW:
+        cv2.destroyAllWindows()
     log.info("Motion detection loop stopped.")
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -321,14 +340,15 @@ def main() -> None:
     log.info("=== Enclosure Monitor started ===")
     log.info("Images     -> %s", IMAGES_DIR)
     log.info("Timelapses -> %s", TIMELAPSE_DIR)
+    log.info("Debug preview: %s", DEBUG_PREVIEW)
 
     IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     TIMELAPSE_DIR.mkdir(parents=True, exist_ok=True)
 
-    cam         = init_camera()
-    stop_event  = threading.Event()
+    cam        = init_camera()
+    stop_event = threading.Event()
 
-    # Start motion detection in a background thread
+    # Motion detection (and preview) runs in a background thread
     motion_thread = threading.Thread(
         target=motion_detection_loop,
         args=(cam, stop_event),
@@ -340,11 +360,10 @@ def main() -> None:
     last_period: "str | None" = None
 
     try:
-        while True:
+        while not stop_event.is_set():
             loop_start     = datetime.now()
             current_period = period_label(loop_start)
 
-            # ── Timelapse trigger ──────────────────────────────────────────
             if last_period is None:
                 last_period = current_period
 
@@ -358,10 +377,8 @@ def main() -> None:
                 build_timelapse(prev_day, last_period)
                 last_period = current_period
 
-            # ── Snapshot ──────────────────────────────────────────────────
             capture_image(cam)
 
-            # ── Sleep until next interval ──────────────────────────────────
             elapsed   = (datetime.now() - loop_start).total_seconds()
             sleep_for = max(0, CAPTURE_INTERVAL_SEC - elapsed)
             log.debug("Next capture in %.1fs", sleep_for)

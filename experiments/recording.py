@@ -10,7 +10,7 @@ Need to pip install picamera and imutils for image processing simplification.
 import cv2
 from picamera import Picamera
 from picamera.array import PiRGBArray
-from keyclipwriter import KeyClipWriter
+from experiments.keyclipwriter import KeyClipWriter
 from imutils.video import VideoStream as vs
 import datetime
 import imutils

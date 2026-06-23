@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""
+Confusion matrix evaluation for a TFLite INT8 SSD detection model using ai-edge-litert.
+Expects a COCO-format annotations JSON and an image directory.
+
+The model outputs boxes (index 498) and scores+classes (index 495).
+A detection is positive if max_score >= --threshold, negative otherwise.
+
+Unannotated images in the JSON, and image files on disk not in the JSON,
+are both treated as negatives (background).
+
+Usage:
+    python confusion_matrix.py \
+        --model model_int8.tflite \
+        --annotations labels.json \
+        --image-dir /path/to/images \
+        [--threshold 0.5] \
+        [--positive-label cockroach] \
+        [--output confusion_matrix.png]
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+# Output tensor indices are NOT stable across separate export_model() calls —
+# TFLite's internal numbering can shift even for structurally identical models.
+# These are resolved dynamically at runtime (see resolve_output_indices) rather
+# than trusted as hardcoded constants. Values below are just a fallback/hint.
+IDX_SCORES_AND_CLASSES = 500
+IDX_BOXES              = 503
+
+
+def resolve_output_indices(interpreter):
+    """Identify the boxes and scores+classes output tensors by their shape
+    rather than a hardcoded index, since TFLite output indices can shift
+    between export_model() calls even for the same model architecture.
+
+    Boxes tensor:          shape (1, N, 4)
+    Scores+classes tensor: shape (1, N, 2)
+    """
+    boxes_idx = None
+    scores_idx = None
+    for d in interpreter.get_output_details():
+        shape = list(d["shape"])
+        if len(shape) == 3 and shape[-1] == 4:
+            boxes_idx = d["index"]
+        elif len(shape) == 3 and shape[-1] == 2:
+            scores_idx = d["index"]
+
+    if boxes_idx is None or scores_idx is None:
+        details = [(d["index"], list(d["shape"])) for d in interpreter.get_output_details()]
+        raise RuntimeError(f"Could not resolve output tensors by shape. Outputs found: {details}")
+
+    return boxes_idx, scores_idx
+
+
+def load_coco_annotations(ann_path, image_dir):
+    """Return:
+      - labels:     {file_name: category_id}  (0 = negative, 1+ = positive)
+      - categories: {category_id: name}
+
+    Negatives come from:
+      1. Images in JSON with no annotation.
+      2. Image files on disk not listed in the JSON at all.
+    """
+    with open(ann_path) as f:
+        coco = json.load(f)
+
+    categories = {cat["id"]: cat["name"] for cat in coco.get("categories", [])}
+    id_to_filename = {img["id"]: img["file_name"] for img in coco["images"]}
+
+    annotated = {}
+    for ann in coco["annotations"]:
+        iid = ann["image_id"]
+        if iid not in annotated:
+            annotated[iid] = ann["category_id"]
+
+    if not categories:
+        for cat_id in sorted(set(annotated.values())):
+            categories[cat_id] = f"class_{cat_id}"
+        print(f"[warn] categories list was empty — auto-generated: {categories}")
+
+    categories[0] = "background"
+
+    labels = {}
+    json_filenames = set()
+    for image_id, file_name in id_to_filename.items():
+        labels[file_name] = annotated.get(image_id, 0)
+        json_filenames.add(file_name)
+
+    image_extensions = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+    n_disk_negatives = 0
+    for p in sorted(Path(image_dir).iterdir()):
+        if p.suffix.lower() in image_extensions and p.name not in json_filenames:
+            labels[p.name] = 0
+            n_disk_negatives += 1
+
+    if n_disk_negatives:
+        print(f"[info] {n_disk_negatives} image(s) on disk not in JSON — treated as negatives")
+
+    return labels, categories
+
+
+def preprocess(img_path, input_shape, input_dtype, input_scale, input_zero_point):
+    _, h, w, _ = input_shape
+    img = Image.open(img_path).convert("RGB").resize((w, h))
+    arr = np.array(img, dtype=np.float32)
+
+    if input_dtype == np.int8:
+        arr = arr / 255.0
+        arr = arr / input_scale + input_zero_point
+        arr = np.clip(np.round(arr), -128, 127).astype(np.int8)
+    elif input_dtype == np.uint8:
+        arr = arr / 255.0
+        arr = arr / input_scale + input_zero_point
+        arr = np.clip(np.round(arr), 0, 255).astype(np.uint8)
+    else:
+        arr = arr / 255.0
+
+    return arr[np.newaxis, ...]
+
+
+def run_inference(interpreter, scores_idx, threshold):
+    """Return (predicted_category_id, max_score).
+
+    Dequantizes the scores+classes tensor, takes the max score across all
+    anchor boxes, and returns category_id=1 if score >= threshold, else 0.
+
+    scores_idx is resolved once per model run via resolve_output_indices(),
+    not hardcoded, since TFLite output tensor indices can shift between
+    separate export_model() calls.
+    """
+    all_outputs = {d["index"]: d for d in interpreter.get_output_details()}
+    sc_detail = all_outputs[scores_idx]
+
+    raw = interpreter.get_tensor(scores_idx)  # (1, N, 2)
+
+    # Dequantize: float = scale * (quantized - zero_point)
+    # Float models have empty scale/zero_point arrays — scale=1.0, zp=0.0 is
+    # then a no-op, which is correct since raw is already float32.
+    qp          = sc_detail.get("quantization_parameters", {})
+    scales      = qp.get("scales", [])
+    zero_points = qp.get("zero_points", [])
+    scale = float(scales[0])      if len(scales) > 0      else 1.0
+    zp    = float(zero_points[0]) if len(zero_points) > 0 else 0.0
+
+    scores_and_classes = scale * (raw.astype(np.float32) - zp)  # (1, N, 2)
+
+    # Column 0 = background score, column 1 = cockroach score
+    cockroach_scores = scores_and_classes[0, :, 1]
+    max_score = float(np.max(cockroach_scores))
+
+    predicted = 1 if max_score >= threshold else 0
+    return predicted, max_score
+
+
+def plot_confusion_matrix(cm, class_names, output_path):
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib not installed — skipping plot. Run: pip install matplotlib")
+        return
+
+    fig, ax = plt.subplots(figsize=(max(6, len(class_names)), max(5, len(class_names))))
+    im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
+    plt.colorbar(im, ax=ax)
+
+    ax.set(
+        xticks=np.arange(len(class_names)),
+        yticks=np.arange(len(class_names)),
+        xticklabels=class_names,
+        yticklabels=class_names,
+        xlabel="Predicted label",
+        ylabel="True label",
+        title=f"Confusion Matrix",
+    )
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+
+    thresh = cm.max() / 2.0
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, str(cm[i, j]),
+                    ha="center", va="center",
+                    color="white" if cm[i, j] > thresh else "black")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    print(f"Confusion matrix saved to: {output_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate TFLite INT8 SSD model — confusion matrix")
+    parser.add_argument("--model",          required=True, help="Path to .tflite model")
+    parser.add_argument("--annotations",    required=True, help="Path to COCO annotations JSON")
+    parser.add_argument("--image-dir",      required=True, help="Directory containing validation images")
+    parser.add_argument("--threshold",      type=float, default=0.5,
+                        help="Detection confidence threshold (default: 0.5)")
+    parser.add_argument("--positive-label", default="cockroach",
+                        help="Name for the positive class (default: cockroach)")
+    parser.add_argument("--output",         default="confusion_matrix.png")
+    args = parser.parse_args()
+
+    # --- Runtime ---
+    try:
+        from ai_edge_litert.interpreter import Interpreter
+    except ImportError:
+        sys.exit("ai-edge-litert not found. Install with: pip install ai-edge-litert")
+
+    # --- Annotations ---
+    print(f"Loading annotations from: {args.annotations}")
+    labels, categories = load_coco_annotations(args.annotations, args.image_dir)
+
+    for cat_id in categories:
+        if cat_id != 0:
+            categories[cat_id] = args.positive_label
+
+    sorted_cat_ids = sorted(categories.keys())
+    class_names    = [categories[cid] for cid in sorted_cat_ids]
+    cat_id_to_idx  = {cid: idx for idx, cid in enumerate(sorted_cat_ids)}
+    num_classes    = len(class_names)
+    print(f"Classes ({num_classes}): {class_names}")
+
+    n_positive = sum(1 for v in labels.values() if v != 0)
+    n_negative = sum(1 for v in labels.values() if v == 0)
+    print(f"Label breakdown — positive: {n_positive}  negative: {n_negative}")
+    print(f"Confidence threshold: {args.threshold}")
+
+    # --- Model ---
+    print(f"Loading model: {args.model}")
+    interpreter = Interpreter(model_path=args.model, num_threads=1)
+    interpreter.allocate_tensors()
+    print("Model loaded and tensors allocated.")
+
+    input_details = interpreter.get_input_details()
+    inp              = input_details[0]
+    input_shape      = inp["shape"]
+    input_dtype      = inp["dtype"]
+    qp               = inp.get("quantization_parameters", {})
+    scales           = qp.get("scales", [])
+    zero_points      = qp.get("zero_points", [])
+    # Float models have empty scale/zero_point arrays (no quantization applied)
+    input_scale      = float(scales[0])      if len(scales) > 0      else 1.0
+    input_zero_point = float(zero_points[0]) if len(zero_points) > 0 else 0.0
+
+    print(f"Input shape: {input_shape}  dtype: {input_dtype.__name__}  "
+          f"scale: {input_scale}  zero_point: {input_zero_point}")
+
+    boxes_idx, scores_idx = resolve_output_indices(interpreter)
+    print(f"Resolved output tensors — boxes: index {boxes_idx}  scores+classes: index {scores_idx}")
+
+    # --- Evaluation ---
+    cm      = np.zeros((num_classes, num_classes), dtype=np.int64)
+    skipped = 0
+    image_dir = Path(args.image_dir)
+    total   = len(labels)
+
+    for i, (file_name, cat_id) in enumerate(labels.items(), 1):
+        img_path = image_dir / file_name
+        if not img_path.exists():
+            print(f"  [warn] not found: {img_path}")
+            skipped += 1
+            continue
+
+        true_idx = cat_id_to_idx.get(cat_id)
+        if true_idx is None:
+            skipped += 1
+            continue
+
+        try:
+            tensor = preprocess(img_path, input_shape, input_dtype, input_scale, input_zero_point)
+            interpreter.set_tensor(input_details[0]["index"], tensor)
+            interpreter.invoke()
+            pred_cat_id, max_score = run_inference(interpreter, scores_idx, args.threshold)
+            pred_idx = cat_id_to_idx.get(pred_cat_id, 0)
+            cm[true_idx, pred_idx] += 1
+        except Exception as e:
+            print(f"  [error] {file_name}: {e}")
+            skipped += 1
+            continue
+
+        if i % 50 == 0 or i == total:
+            print(f"  Progress: {i}/{total}", end="\r")
+
+    print()
+
+    # --- Results ---
+    total_evaluated = cm.sum()
+    correct  = np.trace(cm)
+    accuracy = correct / total_evaluated if total_evaluated > 0 else 0.0
+
+    print(f"\nEvaluated: {total_evaluated}  Skipped: {skipped}")
+    print(f"Overall accuracy: {correct}/{total_evaluated} = {accuracy:.4f} ({accuracy*100:.2f}%)\n")
+
+    print("Confusion matrix (rows=true, cols=predicted):")
+    header = f"{'':20s}" + "".join(f"{n:>12s}" for n in class_names)
+    print(header)
+    for i, row_name in enumerate(class_names):
+        row = f"{row_name:20s}" + "".join(f"{cm[i, j]:>12d}" for j in range(num_classes))
+        print(row)
+
+    print("\nPer-class metrics:")
+    print(f"{'Class':20s}  {'Precision':>10s}  {'Recall':>10s}  {'F1':>10s}  {'Support':>8s}")
+    for i, name in enumerate(class_names):
+        tp = cm[i, i]
+        fp = cm[:, i].sum() - tp
+        fn = cm[i, :].sum() - tp
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1        = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        support   = cm[i, :].sum()
+        print(f"{name:20s}  {precision:>10.4f}  {recall:>10.4f}  {f1:>10.4f}  {support:>8d}")
+
+    plot_confusion_matrix(cm, class_names, args.output)
+
+
+if __name__ == "__main__":
+    main()
