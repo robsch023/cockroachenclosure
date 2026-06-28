@@ -1,6 +1,6 @@
 """
 Robert Schaefer
-17/06/2026
+25/05/2026
 
 Cockroach detection + door controller for Raspberry Pi with Camera Module 3.
 
@@ -86,11 +86,21 @@ MODEL_PATH        = "/home/rosch023/enclosure/model_float.tflite"  # update file
 # empirically best threshold found via the confusion matrix script. Re-tune
 # this any time the model is re-exported.
 CONFIDENCE_THRESH = 0.11
+# Minimum seconds the door stays open after any open trigger (cockroach
+# detection or remote Pi signal). Prevents the door from closing immediately
+# if the cockroach exits frame before it has finished passing through.
+DOOR_HOLD_SEC  = 8.0
+# Number of consecutive frames a cockroach must be detected in before the
+# door is triggered to open. Filters out single-frame false positives from
+# noisy/flickering scores without meaningfully delaying real detections
+# (a genuine cockroach stays in frame for many frames in a row).
+# Set to 1 to disable (trigger on the very first detected frame, old behaviour).
+CONFIRM_FRAMES = 3
 TARGET_LABEL      = "cockroach"
-FRAME_WIDTH       = 1640
-FRAME_HEIGHT      = 922
+FRAME_WIDTH       = 640
+FRAME_HEIGHT      = 480
 FPS               = 16
-SHOW_VIDEO        = True          # set True to preview on a connected display
+SHOW_VIDEO        = False          # set True to preview on a connected display
 SAVEPATH          = "/home/rosch023/local_mount/labtestdata/doorcam"
 BUF_SIZE          = 32            # pre-roll frames kept before a trigger
 IDLE_TIMEOUT_FRAMES = int(FPS * 10)  # frames of no-detection before clip closes
@@ -661,7 +671,8 @@ def main():
     servo      = DoorServo()
     clip       = ClipWriter(buf_size=BUF_SIZE)
     fourcc     = cv2.VideoWriter_fourcc(*'MJPG')
-    idle_frames = 0
+    idle_frames    = 0
+    confirm_frames = 0   # consecutive frames with a cockroach detection
 
     moisture_stop   = threading.Event()
     moisture_sensor = MoistureSensor()
@@ -673,7 +684,8 @@ def main():
     )
     moisture_thread.start()
 
-    door_open = False
+    door_open       = False
+    door_open_until = 0.0   # epoch timestamp after which the door may close
     servo.close_door()
 
     print("[INFO] Starting detection loop. Press 'q' to quit.", flush=True)
@@ -700,7 +712,17 @@ def main():
                 d for d in detections
                 if d["label"] == TARGET_LABEL
             ]
-            cockroach_in_zone = len(trigger_detections) > 0
+            raw_detection = len(trigger_detections) > 0
+
+            # ── Consecutive-frames confirmation ───────────────────────────────
+            # Only count as a real detection once the model has flagged a
+            # cockroach for CONFIRM_FRAMES frames in a row. Filters out
+            # single-frame false positives without delaying genuine detections.
+            if raw_detection:
+                confirm_frames += 1
+            else:
+                confirm_frames = 0
+            cockroach_in_zone = confirm_frames >= CONFIRM_FRAMES
 
             # ── Remote-Pi poll ────────────────────────────────────────────────
             remote_open_signal = remote_pi_requesting_open()
@@ -717,14 +739,18 @@ def main():
                 or (not active_now and cockroach_in_zone)
             )
 
+            now_ts = time.time()
+
             if should_open and not door_open:
+                # ── Transition: CLOSED → OPEN ─────────────────────────────────
                 reason = []
                 if cockroach_in_zone:  reason.append("cockroach detected")
                 if remote_open_signal: reason.append("remote Pi signal")
                 print(f"[DOOR ] OPEN  ← {', '.join(reason)}  "
                       f"| {timestamp.strftime('%H:%M:%S')}", flush=True)
                 threading.Thread(target=servo.open_door, daemon=True).start()
-                door_open = True
+                door_open       = True
+                door_open_until = now_ts + DOOR_HOLD_SEC
 
                 if not clip.recording:
                     clip_name = (f"{SAVEPATH}/"
@@ -732,12 +758,27 @@ def main():
                     clip.start(clip_name, fourcc, FPS,
                                (frame.shape[1], frame.shape[0]))
 
-            elif not should_open and door_open:
-                reason = "schedule ended" if not active_now else "no trigger"
+            elif should_open and door_open:
+                # Door already open and trigger still active — extend hold
+                # timer so the door stays open as long as something is there.
+                door_open_until = now_ts + DOOR_HOLD_SEC
+
+            elif not should_open and door_open and now_ts >= door_open_until:
+                # ── Transition: OPEN → CLOSED (hold period elapsed) ───────────
+                reason = "schedule ended" if not active_now else "hold expired"
+                remaining = max(0.0, door_open_until - now_ts)
                 print(f"[DOOR ] CLOSE ← {reason}  "
                       f"| {timestamp.strftime('%H:%M:%S')}", flush=True)
                 threading.Thread(target=servo.close_door, daemon=True).start()
                 door_open = False
+
+            elif not should_open and door_open:
+                # Hold period still active — log remaining time at most once
+                # per second to avoid flooding the journal.
+                remaining = door_open_until - now_ts
+                if int(remaining) != int(remaining + (1 / FPS)):
+                    print(f"[DOOR ] holding open — {remaining:.1f}s remaining",
+                          flush=True)
 
             # ── Detection signal & clip timeout ───────────────────────────────
             if cockroach_in_zone:
@@ -772,6 +813,9 @@ def main():
 
             door_label  = "DOOR: OPEN" if door_open else "DOOR: CLOSED"
             door_colour = (0, 255, 0)  if door_open else (0, 0, 255)
+            if door_open:
+                remaining = max(0.0, door_open_until - time.time())
+                door_label += f"  ({remaining:.1f}s)"
             cv2.putText(frame, door_label, (10, 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, door_colour, 2)
 
@@ -779,6 +823,12 @@ def main():
             period_colour = (0, 255, 200) if active_now else (80, 80, 80)
             cv2.putText(frame, period_label, (10, 46),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, period_colour, 1)
+
+            if raw_detection and not cockroach_in_zone:
+                confirm_colour = (0, 165, 255)   # amber — building confirmation
+                cv2.putText(frame, f"confirming: {confirm_frames}/{CONFIRM_FRAMES}",
+                            (10, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                            confirm_colour, 1)
 
             if clip.recording:
                 cv2.circle(frame, (w - 18, 18), 8, (0, 0, 255), -1)
