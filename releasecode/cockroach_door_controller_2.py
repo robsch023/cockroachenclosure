@@ -1,6 +1,6 @@
 """
 Robert Schaefer
-25/05/2026
+23/06/2026
 
 Cockroach detection + door controller for Raspberry Pi with Camera Module 3.
 
